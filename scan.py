@@ -1,16 +1,24 @@
 from scapy.all import *
 from scapy.layers.dot11 import Dot11, Dot11Elt, RadioTap
 from scapy.layers.inet import IP, ICMP, TCP
+from scapy.arch.windows import get_windows_if_list
 from rich.console import Console
 from rich.table import Table
 from rich.prompt import Prompt
 import argparse
 import time
 import os
+import ctypes
 import sys
 import threading
 import subprocess
 import ipaddress
+
+# Check for admin privileges
+if os.name == 'nt' and not ctypes.windll.shell32.IsUserAnAdmin():
+    print("ERROR: This script requires Administrator privileges!")
+    time.sleep(2)
+    sys.exit(1)
 
 console = Console()
 networks = {}
@@ -18,7 +26,7 @@ clients = {}
 stop_event = threading.Event()
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Advanced Wi-Fi Network Scanner for Linux")
+    parser = argparse.ArgumentParser(description="Advanced Wi-Fi Network Scanner for Windows")
     parser.add_argument("-i", "--interface", help="Network interface name")
     parser.add_argument("-c", "--channel", type=int, help="Specific channel to scan")
     parser.add_argument("-t", "--timeout", type=int, default=30,
@@ -27,12 +35,14 @@ def parse_args():
     return parser.parse_args()
 
 def get_wifi_interface(user_interface=None):
-    interfaces = subprocess.check_output("iwconfig", shell=True).decode().split('\n')
-    wlan_ifaces = [iface.split()[0] for iface in interfaces if 'IEEE 802.11' in iface]
+    interfaces = get_windows_if_list()
+    wlan_ifaces = [iface for iface in interfaces
+                  if 'wireless' in iface['name'].lower() or 'wi-fi' in iface['name'].lower()]
 
     if user_interface:
-        if user_interface in wlan_ifaces:
-            return user_interface
+        for iface in wlan_ifaces:
+            if iface['name'].lower() == user_interface.lower():
+                return iface['name']
         console.print(f"[red]Error: Interface {user_interface} not found![/red]")
         return None
 
@@ -40,10 +50,10 @@ def get_wifi_interface(user_interface=None):
         console.print("[red]No wireless interfaces found![/red]")
         console.print("[yellow]Available interfaces:[/yellow]")
         for iface in interfaces:
-            console.print(f"- [cyan]{iface.split()[0]}[/cyan]")
+            console.print(f"- [cyan]{iface['name']}[/cyan] (Driver: {iface['driver']})")
         return None
 
-    return wlan_ifaces[0]
+    return wlan_ifaces[0]['name']
 
 def channel_operations(interface, args):
     channels = [args.channel] if args.channel else [1, 6, 11]
@@ -51,7 +61,7 @@ def channel_operations(interface, args):
 
     try:
         for channel in channels:
-            result = os.system(f"iwconfig {interface} channel {channel}")
+            result = os.system(f'netsh wlan set channel channel={channel} interface="{interface}"')
             if args.debug:
                 if result == 0:
                     console.print(f"  ✓ Locked to channel {channel}", style="green")
@@ -138,7 +148,7 @@ def scan_network_devices(target_network):
     console.print(f"\n[bold]Scanning devices on network: {target_network}[/bold]")
 
     # Get local IP and subnet
-    local_ip = subprocess.check_output("hostname -I | awk '{print $1}'", shell=True).decode().strip()
+    local_ip = subprocess.check_output("ipconfig | findstr IPv4", shell=True).decode().split(":")[1].strip()
     network = ipaddress.IPv4Network(f"{local_ip}/24", strict=False)
 
     # Ping sweep
@@ -148,7 +158,7 @@ def scan_network_devices(target_network):
             break
         host = str(host)
         try:
-            res = subprocess.call(['ping', '-c', '1', '-W', '1', host],
+            res = subprocess.call(['ping', '-n', '1', '-w', '500', host],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if res == 0:
                 live_hosts.append(host)
@@ -211,6 +221,10 @@ def interactive_menu():
 def main():
     args = parse_args()
 
+    # Windows-specific Scapy configuration
+    conf.use_pcap = False
+    conf.use_winpcapy = True
+
     # Interface detection
     interface = get_wifi_interface(args.interface)
     if not interface:
@@ -226,12 +240,13 @@ def main():
         hopper.daemon = True
         hopper.start()
 
- # Packet capture
+    # Packet capture
     try:
         sniff(iface=interface,
              prn=lambda pkt: process_packet(pkt, args),
              timeout=args.timeout,
-             store=0)
+             store=0,
+             L3socket=conf.L3socket)
     except Exception as e:
         console.print(f"[red]Capture error: {e}[/red]")
     finally:
